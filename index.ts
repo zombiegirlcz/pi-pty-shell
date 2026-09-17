@@ -284,6 +284,7 @@ class PtyOverlayComponent {
   private exitCode: number | null = null;
   private exitSignal: number | null = null;
   private hasExited = false;
+  private renderInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     handle: PtyHandle,
@@ -294,6 +295,13 @@ class PtyOverlayComponent {
     this.tui = tui;
     this.done = done;
 
+    // Periodic render — shows live output as it arrives
+    this.renderInterval = setInterval(() => {
+      if (this.disposed) return;
+      this.version++;
+      this.tui.requestRender();
+    }, 100); // 10 FPS refresh
+
     // Listen for exit
     handle.process.onExit(({ exitCode, signal }: { exitCode: number; signal?: number }) => {
       this.exitCode = exitCode;
@@ -302,13 +310,17 @@ class PtyOverlayComponent {
       this.version++;
       this.tui.requestRender();
       // Auto-close after a short delay so user sees final state
-      setTimeout(() => this.finish(), 500);
+      setTimeout(() => this.finish(), 800);
     });
   }
 
   private finish(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.renderInterval) {
+      clearInterval(this.renderInterval);
+      this.renderInterval = null;
+    }
     this.handle.kill();
     const output = this.handle.getOutput();
     this.done({
@@ -362,8 +374,6 @@ class PtyOverlayComponent {
     if (this.cachedWidth === width && this.cachedVersion === this.version) {
       return this.cachedLines;
     }
-
-    this.version++;
     const output = this.handle.getOutput();
     const lines = output.split("\n");
     const maxLines = Math.min(lines.length, 50);
@@ -392,6 +402,10 @@ class PtyOverlayComponent {
 
   dispose(): void {
     this.disposed = true;
+    if (this.renderInterval) {
+      clearInterval(this.renderInterval);
+      this.renderInterval = null;
+    }
     this.handle.kill();
   }
 }
