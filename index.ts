@@ -1,32 +1,29 @@
 /**
  * pi-pty-shell — Full interactive PTY extension for pi
  *
- * Port of gemini-cli's ShellExecutionService PTY logic into a pi extension.
- * Enables running fully interactive TUI applications (vim, htop, nano, etc.)
- * with real terminal access.
- *
  * Two modes:
- *   1. CAPTURE mode (default for pty_exec tool):
- *      Spawns via node-pty, captures output through @xterm/headless,
- *      and renders the result directly in the tool call output window.
- *      No screen flash, output stays visible.
+ *   1. STREAMING mode (default for pty_exec):
+ *      Spawns via node-pty, streams output live via onUpdate() into
+ *      the tool call result window. Output visible immediately.
+ *      For interactive TUI apps (htop, top), renders inside a
+ *      ctx.ui.custom() component with keyboard/mouse forwarding.
  *
- *   2. HANDOFF mode (for truly interactive apps via !vim, !nano, etc.):
- *      Suspends pi TUI, hands terminal to child process, restores after exit.
- *      Used when the command needs real keyboard input (editors, etc.)
+ *   2. HANDOFF mode (for vim, nano, ssh):
+ *      Suspends pi TUI, hands terminal to child, restores after exit.
  *
  * Usage:
- *   !vim file.txt          (auto-detected → handoff mode)
- *   !i any-command         (force handoff mode)
- *   !top -n 5              (capture mode — output stays in tool call)
- *   /pty <command>         (capture mode)
- *   pty_exec tool          (LLM agent — capture mode by default)
+ *   !htop               → interactive overlay (keyboard forwarded)
+ *   !top -b -n 1        → streaming capture in tool result
+ *   !vim file.txt       → handoff (full terminal)
+ *   !i any-command      → force handoff
+ *   /pty <command>      → streaming overlay
+ *   pty_exec tool       → streaming or interactive overlay
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawnSync } from "node:child_process";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, matchesKey, Key, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
 // Interactive command detection
@@ -49,7 +46,7 @@ const DEFAULT_INTERACTIVE_COMMANDS = [
   "tmux", "screen", "ncdu",
 ];
 
-/** Commands that NEED full handoff (real keyboard input required) */
+/** Commands needing full handoff (real keyboard, full-screen TUI editor) */
 const HANDOFF_ONLY_COMMANDS = new Set([
   "vim", "nvim", "vi", "nano", "emacs", "pico", "micro", "helix", "hx", "kak",
   "ssh", "telnet", "mosh", "tmux", "screen",
@@ -60,6 +57,11 @@ const HANDOFF_ONLY_COMMANDS = new Set([
   "kubectl edit", "kubectl exec -it", "docker exec -it", "docker run -it",
   "ranger", "nnn", "lf", "mc", "vifm", "fzf", "sk",
   "psql", "mysql", "sqlite3", "mongosh", "redis-cli",
+]);
+
+/** Commands that are interactive TUI but can run in overlay (not full handoff) */
+const OVERLAY_INTERACTIVE_COMMANDS = new Set([
+  "htop", "top", "btop", "glances", "tig", "lazygit", "gitui", "ncdu",
 ]);
 
 function getInteractiveCommands(): string[] {
@@ -84,15 +86,11 @@ function isInteractiveCommand(command: string): boolean {
       trimmed === cmdLower ||
       trimmed.startsWith(`${cmdLower} `) ||
       trimmed.startsWith(`${cmdLower}\t`)
-    ) {
-      return true;
-    }
+    ) return true;
     const pipeIdx = trimmed.lastIndexOf("|");
     if (pipeIdx !== -1) {
       const afterPipe = trimmed.slice(pipeIdx + 1).trim();
-      if (afterPipe === cmdLower || afterPipe.startsWith(`${cmdLower} `)) {
-        return true;
-      }
+      if (afterPipe === cmdLower || afterPipe.startsWith(`${cmdLower} `)) return true;
     }
   }
   return false;
@@ -101,180 +99,147 @@ function isInteractiveCommand(command: string): boolean {
 function needsHandoff(command: string): boolean {
   const trimmed = command.trim().toLowerCase();
   for (const cmd of HANDOFF_ONLY_COMMANDS) {
-    const cmdLower = cmd.toLowerCase();
-    if (
-      trimmed === cmdLower ||
-      trimmed.startsWith(`${cmdLower} `) ||
-      trimmed.startsWith(`${cmdLower}\t`)
-    ) {
+    if (trimmed === cmd || trimmed.startsWith(`${cmd} `) || trimmed.startsWith(`${cmd}\t`))
       return true;
-    }
+  }
+  return false;
+}
+
+function isOverlayInteractive(command: string): boolean {
+  const trimmed = command.trim().toLowerCase();
+  for (const cmd of OVERLAY_INTERACTIVE_COMMANDS) {
+    if (trimmed === cmd || trimmed.startsWith(`${cmd} `) || trimmed.startsWith(`${cmd}\t`))
+      return true;
   }
   return false;
 }
 
 // ---------------------------------------------------------------------------
-// PTY Capture execution (gemini-cli shellExecutionService port)
-// Spawns via node-pty, captures through headless terminal, returns output.
-// No screen flash — output rendered in tool call result.
+// PTY helpers
 // ---------------------------------------------------------------------------
 
-interface PtyCaptureResult {
-  exitCode: number | null;
-  output: string;
-  ansiOutput?: string;
-  error?: string;
-}
+let ptyModule: any = null;
+let xtermModule: any = null;
 
-async function runWithPtyCapture(
-  command: string,
-  opts?: { cwd?: string; timeoutMs?: number; cols?: number; rows?: number },
-): Promise<PtyCaptureResult> {
-  const cols = opts?.cols ?? process.stdout.columns ?? 80;
-  const rows = opts?.rows ?? process.stdout.rows ?? 30;
-  const timeoutMs = opts?.timeoutMs ?? 30_000;
-  const cwd = opts?.cwd ?? process.cwd();
-
-  let pty: any;
+async function getPty(): Promise<any> {
+  if (ptyModule) return ptyModule;
   try {
-    pty = await import("@lydell/node-pty");
+    ptyModule = await import("@lydell/node-pty");
   } catch {
     try {
-      pty = await import("node-pty");
+      ptyModule = await import("node-pty");
     } catch {
-      return {
-        exitCode: 1,
-        output: "(node-pty not available — install @lydell/node-pty)",
-        error: "node-pty not found",
-      };
+      return null;
     }
   }
+  return ptyModule;
+}
 
-  let headlessTerminal: any;
+async function getXterm(): Promise<any> {
+  if (xtermModule) return xtermModule;
   try {
-    const xterm = await import("@xterm/headless");
-    headlessTerminal = new xterm.Terminal({
+    xtermModule = await import("@xterm/headless");
+  } catch {
+    return null;
+  }
+  return xtermModule;
+}
+
+interface PtyHandle {
+  process: any;
+  terminal: any | null;
+  cols: number;
+  rows: number;
+  getOutput(): string;
+  write(data: string): void;
+  resize(cols: number, rows: number): void;
+  kill(): void;
+}
+
+async function spawnPty(
+  command: string,
+  opts?: { cwd?: string; cols?: number; rows?: number },
+): Promise<PtyHandle | null> {
+  const pty = await getPty();
+  if (!pty) return null;
+
+  const cols = opts?.cols ?? process.stdout.columns ?? 80;
+  const rows = opts?.rows ?? process.stdout.rows ?? 30;
+  const cwd = opts?.cwd ?? process.cwd();
+  const shell = process.env.SHELL || "/bin/sh";
+
+  let terminal: any = null;
+  const xterm = await getXterm();
+  if (xterm) {
+    terminal = new xterm.Terminal({
       allowProposedApi: true,
       cols,
       rows,
       scrollback: 5000,
     });
-  } catch {
-    // Fallback: capture raw text without terminal emulation
-    headlessTerminal = null;
   }
 
-  return new Promise<PtyCaptureResult>((resolve) => {
-    const shell = process.env.SHELL || "/bin/sh";
-    let resolved = false;
-    let rawOutput = "";
+  const ptyProcess = pty.spawn(shell, ["-c", command], {
+    name: "xterm-256color",
+    cols,
+    rows,
+    cwd,
+    env: { ...process.env, TERM: "xterm-256color" },
+  });
 
-    const finish = (exitCode: number | null, error?: string) => {
-      if (resolved) return;
-      resolved = true;
+  ptyProcess.onData((data: string) => {
+    if (terminal) {
+      try { terminal.write(data); } catch { /* ignore */ }
+    }
+  });
 
-      let output: string;
-      let ansiOutput: string | undefined;
-
-      if (headlessTerminal) {
-        try {
-          const buf = headlessTerminal.buffer.active;
-          const lines: string[] = [];
-          let lastContent = -1;
-
-          for (let i = buf.length - 1; i >= 0; i--) {
-            const line = buf.getLine(i);
-            if (line && line.translateToString(true).trim().length > 0) {
-              lastContent = i;
-              break;
-            }
+  return {
+    process: ptyProcess,
+    terminal,
+    cols,
+    rows,
+    getOutput(): string {
+      if (!terminal) return "";
+      try {
+        const buf = terminal.buffer.active;
+        const lines: string[] = [];
+        let lastContent = -1;
+        for (let i = buf.length - 1; i >= 0; i--) {
+          const line = buf.getLine(i);
+          if (line && line.translateToString(true).trim().length > 0) {
+            lastContent = i;
+            break;
           }
-
-          if (lastContent >= 0) {
-            for (let i = 0; i <= lastContent; i++) {
-              const line = buf.getLine(i);
-              lines.push(line ? line.translateToString(true) : "");
-            }
-          }
-
-          output = lines.join("\n").trim();
-
-          // Also get ANSI version for rendering
-          const ansiLines: string[] = [];
+        }
+        if (lastContent >= 0) {
           for (let i = 0; i <= lastContent; i++) {
             const line = buf.getLine(i);
-            if (line) {
-              let lineStr = "";
-              for (let col = 0; col < buf.length; col++) {
-                // translateToString with trimRight=false preserves spacing
-                lineStr = line.translateToString(false);
-                break;
-              }
-              ansiLines.push(lineStr);
-            } else {
-              ansiLines.push("");
-            }
+            lines.push(line ? line.translateToString(true) : "");
           }
-          ansiOutput = ansiLines.join("\n").trimEnd();
-        } catch {
-          output = rawOutput;
         }
-      } else {
-        output = rawOutput;
+        return lines.join("\n");
+      } catch {
+        return "";
       }
-
+    },
+    write(data: string) {
+      try { ptyProcess.write(data); } catch { /* ignore */ }
+    },
+    resize(newCols: number, newRows: number) {
       try {
-        headlessTerminal?.dispose();
+        ptyProcess.resize(newCols, newRows);
+        if (terminal) terminal.resize(newCols, newRows);
       } catch { /* ignore */ }
-
-      resolve({
-        exitCode,
-        output: output || "(no output)",
-        ansiOutput,
-        error,
-      });
-    };
-
-    let ptyProcess: any;
-    try {
-      ptyProcess = pty.spawn(shell, ["-c", command], {
-        name: "xterm-256color",
-        cols,
-        rows,
-        cwd,
-        env: { ...process.env, TERM: "xterm-256color" },
-      });
-    } catch (e: any) {
-      finish(1, e.message);
-      return;
-    }
-
-    const timer = setTimeout(() => {
+    },
+    kill() {
       try { ptyProcess.kill(); } catch { /* ignore */ }
-      finish(null, "timeout");
-    }, timeoutMs);
-
-    ptyProcess.onData((data: string) => {
-      rawOutput += data;
-      if (headlessTerminal) {
-        try {
-          headlessTerminal.write(data);
-        } catch { /* ignore */ }
-      }
-    });
-
-    ptyProcess.onExit(({ exitCode, signal }: { exitCode: number; signal?: number }) => {
-      clearTimeout(timer);
-      // Small delay to let headless terminal process remaining data
-      setTimeout(() => {
-        finish(exitCode, signal ? `killed by signal ${signal}` : undefined);
-      }, 50);
-    });
-  });
+      try { terminal?.dispose(); } catch { /* ignore */ }
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Full TTY handoff (for truly interactive apps: vim, nano, ssh, etc.)
+// Full TTY handoff (vim, nano, ssh — needs real terminal)
 // ---------------------------------------------------------------------------
 
 interface PtyResult {
@@ -286,16 +251,13 @@ interface PtyResult {
 function runWithFullTty(command: string, tui: any): PtyResult {
   tui.stop();
   process.stdout.write("\x1b[2J\x1b[H");
-
   const shell = process.env.SHELL || "/bin/sh";
   const result = spawnSync(shell, ["-c", command], {
     stdio: "inherit",
     env: { ...process.env, TERM: "xterm-256color" },
   });
-
   tui.start();
   tui.requestRender(true);
-
   return {
     exitCode: result.status,
     output: result.status === 0
@@ -303,6 +265,135 @@ function runWithFullTty(command: string, tui: any): PtyResult {
       : `(interactive command exited with code ${result.status})`,
     error: result.error?.message,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Interactive PTY overlay component (htop, top, etc.)
+// Renders live PTY output, forwards keyboard input to the process.
+// ---------------------------------------------------------------------------
+
+class PtyOverlayComponent {
+  private handle: PtyHandle;
+  private tui: any;
+  private done: (result: PtyResult) => void;
+  private cachedLines: string[] = [];
+  private cachedWidth = 0;
+  private version = 0;
+  private cachedVersion = -1;
+  private disposed = false;
+  private exitCode: number | null = null;
+  private exitSignal: number | null = null;
+  private hasExited = false;
+
+  constructor(
+    handle: PtyHandle,
+    tui: any,
+    done: (result: PtyResult) => void,
+  ) {
+    this.handle = handle;
+    this.tui = tui;
+    this.done = done;
+
+    // Listen for exit
+    handle.process.onExit(({ exitCode, signal }: { exitCode: number; signal?: number }) => {
+      this.exitCode = exitCode;
+      this.exitSignal = signal ?? null;
+      this.hasExited = true;
+      this.version++;
+      this.tui.requestRender();
+      // Auto-close after a short delay so user sees final state
+      setTimeout(() => this.finish(), 500);
+    });
+  }
+
+  private finish(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.handle.kill();
+    const output = this.handle.getOutput();
+    this.done({
+      exitCode: this.exitCode,
+      output: output || "(no output)",
+      error: this.exitSignal ? `killed by signal ${this.exitSignal}` : undefined,
+    });
+  }
+
+  handleInput(data: string): void {
+    if (this.hasExited) {
+      // Any key after exit dismisses
+      this.finish();
+      return;
+    }
+
+    // ESC or q to quit
+    if (matchesKey(data, Key.escape) || data === "q" || data === "Q") {
+      this.handle.kill();
+      this.finish();
+      return;
+    }
+
+    // Forward all input to PTY process
+    this.handle.write(data);
+  }
+
+  handleMouse(event: any): any {
+    if (this.hasExited) return undefined;
+    // Forward mouse events to PTY (for htop, etc.)
+    // SGR mouse mode: ESC [ < button ; col ; row M/m
+    if (event.type === "press" || event.type === "click") {
+      const seq = `\x1b[<${event.button ?? 0};${event.col ?? 1};${event.row ?? 1}M`;
+      this.handle.write(seq);
+      return { handled: true };
+    }
+    if (event.type === "release") {
+      const seq = `\x1b[<${event.button ?? 0};${event.col ?? 1};${event.row ?? 1}m`;
+      this.handle.write(seq);
+      return { handled: true };
+    }
+    return undefined;
+  }
+
+  invalidate(): void {
+    this.cachedWidth = 0;
+    this.cachedVersion = -1;
+  }
+
+  render(width: number): string[] {
+    if (this.cachedWidth === width && this.cachedVersion === this.version) {
+      return this.cachedLines;
+    }
+
+    this.version++;
+    const output = this.handle.getOutput();
+    const lines = output.split("\n");
+    const maxLines = Math.min(lines.length, 50);
+    const displayLines = lines.slice(-maxLines); // show last N lines
+
+    const header = this.hasExited
+      ? `\x1b[32m✓ exit ${this.exitCode ?? "?"}\x1b[0m`
+      : `\x1b[33m● running\x1b[0m`;
+    const hint = this.hasExited
+      ? " \x1b[2m(press any key)\x1b[0m"
+      : " \x1b[2m(ESC/q to quit, keys forwarded)\x1b[0m";
+
+    const result: string[] = [];
+    result.push(truncateToWidth(`${header}${hint}`, width));
+    result.push(truncateToWidth("\x1b[90m" + "─".repeat(Math.min(width - 1, 60)) + "\x1b[0m", width));
+
+    for (const line of displayLines) {
+      result.push(truncateToWidth(line, width));
+    }
+
+    this.cachedLines = result;
+    this.cachedWidth = width;
+    this.cachedVersion = this.version;
+    return result;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.handle.kill();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,145 +414,239 @@ export default function (pi: ExtensionAPI) {
     }
 
     const shouldBeInteractive = forceHandoff || isInteractiveCommand(command);
-    if (!shouldBeInteractive) {
-      return;
-    }
+    if (!shouldBeInteractive) return;
 
     if (ctx.mode !== "tui") {
       return {
         result: {
           output: "(interactive commands require TUI mode)",
-          exitCode: 1,
-          cancelled: false,
-          truncated: false,
+          exitCode: 1, cancelled: false, truncated: false,
         },
       };
     }
 
-    // Decide: handoff vs capture
-    const useHandoff = forceHandoff || needsHandoff(command);
-
-    if (useHandoff) {
+    // Handoff mode
+    if (forceHandoff || needsHandoff(command)) {
       const ptyResult = await ctx.ui.custom<PtyResult>((tui, _theme, _kb, done) => {
         const result = runWithFullTty(command, tui);
         done(result);
         return { render: () => [], invalidate: () => {} };
+      });
+      return {
+        result: {
+          output: ptyResult?.output ?? "(no output)",
+          exitCode: ptyResult?.exitCode ?? 1,
+          cancelled: false, truncated: false,
+        },
+      };
+    }
+
+    // Overlay interactive (htop, top, etc.)
+    if (isOverlayInteractive(command)) {
+      const ptyResult = await ctx.ui.custom<PtyResult>((tui, _theme, _kb, done) => {
+        let component: PtyOverlayComponent | null = null;
+        spawnPty(command, { cwd: ctx.cwd }).then((handle) => {
+          if (!handle) {
+            done({ exitCode: 1, output: "(PTY not available)" });
+            return;
+          }
+          component = new PtyOverlayComponent(handle, tui, done);
+        });
+        return {
+          render(width: number): string[] {
+            if (!component) return ["\x1b[33mStarting PTY...\x1b[0m"];
+            return component.render(width);
+          },
+          handleInput(data: string) {
+            component?.handleInput(data);
+            tui.requestRender();
+          },
+          handleMouse(event: any) {
+            return component?.handleMouse(event);
+          },
+          invalidate() {
+            component?.invalidate();
+          },
+        };
       });
 
       return {
         result: {
           output: ptyResult?.output ?? "(no output)",
           exitCode: ptyResult?.exitCode ?? 1,
-          cancelled: false,
-          truncated: false,
+          cancelled: false, truncated: false,
         },
       };
     }
 
-    // Capture mode: run via PTY, show output in tool result
-    const captureResult = await runWithPtyCapture(command, {
-      cwd: ctx.cwd,
-      timeoutMs: 15_000,
+    // Streaming capture (non-interactive PTY commands)
+    const handle = await spawnPty(command, { cwd: ctx.cwd });
+    if (!handle) {
+      return {
+        result: { output: "(PTY not available)", exitCode: 1, cancelled: false, truncated: false },
+      };
+    }
+
+    const output = await new Promise<string>((resolve) => {
+      let collected = "";
+      handle.process.onData((data: string) => { collected += data; });
+      handle.process.onExit(() => {
+        setTimeout(() => resolve(handle.getOutput() || collected), 50);
+      });
+      setTimeout(() => {
+        handle.kill();
+        resolve(handle.getOutput() || collected || "(timeout)");
+      }, 15_000);
     });
 
     return {
       result: {
-        output: captureResult.output,
-        exitCode: captureResult.exitCode ?? 1,
-        cancelled: false,
-        truncated: false,
+        output: output || "(no output)",
+        exitCode: 0,
+        cancelled: false, truncated: false,
       },
     };
   });
 
   // -----------------------------------------------------------------------
-  // 2. Register pty_exec tool — capture mode by default
+  // 2. pty_exec tool — streaming + interactive overlay
   // -----------------------------------------------------------------------
   pi.registerTool({
     name: "pty_exec",
     label: "Interactive PTY",
     description:
-      "Run a command with PTY (pseudo-terminal) access. " +
-      "Output is captured and displayed in this tool call result. " +
-      "Use for TUI applications like top, htop, or any command that needs a real terminal. " +
-      "Set handoff=true for commands needing keyboard input (vim, nano, ssh).",
+      "Run a command with PTY access. For TUI apps (htop, top), shows a live " +
+      "interactive overlay with keyboard forwarding. For other commands, streams " +
+      "output into this tool result. Use handoff=true for editors (vim, nano).",
     promptSnippet:
-      "Run terminal applications (top, htop, etc.) with PTY — output shown in tool result",
+      "Run terminal apps with live PTY output shown in an interactive overlay",
     promptGuidelines: [
-      "Use pty_exec for commands that need a real terminal (top, htop, tput, etc.).",
-      "Use pty_exec with handoff=true only for truly interactive apps (vim, nano, ssh).",
+      "Use pty_exec for commands needing a real terminal (top, htop, etc.).",
+      "Use pty_exec with handoff=true only for editors and SSH (vim, nano, ssh).",
     ],
     parameters: Type.Object({
       command: Type.String({ description: "The command to run" }),
-      cwd: Type.Optional(
-        Type.String({ description: "Working directory (defaults to current)" }),
-      ),
-      handoff: Type.Optional(
-        Type.Boolean({
-          description:
-            "If true, suspends pi TUI and hands terminal to the command " +
-            "(for vim, nano, ssh). Default false = capture output in tool result.",
-        }),
-      ),
-      timeout: Type.Optional(
-        Type.Number({
-          description: "Timeout in seconds (default 30)",
-          minimum: 1,
-          maximum: 300,
-        }),
-      ),
+      cwd: Type.Optional(Type.String({ description: "Working directory" })),
+      handoff: Type.Optional(Type.Boolean({
+        description: "True for full terminal handoff (vim, nano, ssh). Default false.",
+      })),
+      timeout: Type.Optional(Type.Number({
+        description: "Timeout in seconds (default 30)", minimum: 1, maximum: 300,
+      })),
     }),
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const command = params.command;
       const workDir = params.cwd || ctx.cwd;
       const timeoutMs = (params.timeout ?? 30) * 1000;
 
-      // Handoff mode: truly interactive
+      // Handoff mode
       if (params.handoff) {
         if (ctx.mode !== "tui") {
           return {
-            content: [{ type: "text", text: "Handoff mode requires TUI." }],
-            details: { error: "non-tui" },
+            content: [{ type: "text", text: "Handoff requires TUI mode." }],
+            details: { error: "non-tui", mode: "handoff" },
           };
         }
-
-        const wrappedCommand = params.cwd
-          ? `cd ${JSON.stringify(workDir)} && ${command}`
-          : command;
-
+        const wrapped = params.cwd ? `cd ${JSON.stringify(workDir)} && ${command}` : command;
         const ptyResult = await ctx.ui.custom<PtyResult>((tui, _theme, _kb, done) => {
-          const result = runWithFullTty(wrappedCommand, tui);
+          const result = runWithFullTty(wrapped, tui);
           done(result);
           return { render: () => [], invalidate: () => {} };
         });
-
         return {
           content: [{ type: "text", text: ptyResult?.output ?? "(completed)" }],
           details: { exitCode: ptyResult?.exitCode ?? 0, mode: "handoff" },
         };
       }
 
-      // Capture mode: run via PTY, return output in tool result
-      onUpdate?.({
-        content: [{ type: "text", text: `Running: ${command}` }],
-      });
+      // Interactive overlay for TUI apps
+      if (isOverlayInteractive(command) && ctx.mode === "tui") {
+        onUpdate?.({ content: [{ type: "text", text: `Starting: ${command}` }] });
 
-      const result = await runWithPtyCapture(command, {
-        cwd: workDir,
-        timeoutMs,
-      });
+        const ptyResult = await ctx.ui.custom<PtyResult>((tui, _theme, _kb, done) => {
+          let component: PtyOverlayComponent | null = null;
 
-      if (result.error) {
+          spawnPty(command, { cwd: workDir }).then((handle) => {
+            if (!handle) {
+              done({ exitCode: 1, output: "(PTY not available)" });
+              return;
+            }
+            component = new PtyOverlayComponent(handle, tui, done);
+          });
+
+          return {
+            render(width: number): string[] {
+              if (!component) return ["\x1b[33mStarting PTY...\x1b[0m"];
+              return component.render(width);
+            },
+            handleInput(data: string) {
+              component?.handleInput(data);
+              tui.requestRender();
+            },
+            handleMouse(event: any) {
+              return component?.handleMouse(event);
+            },
+            invalidate() {
+              component?.invalidate();
+            },
+          };
+        });
+
         return {
-          content: [{ type: "text", text: `Error: ${result.error}\n${result.output}` }],
-          details: { exitCode: result.exitCode, error: result.error, mode: "capture" },
+          content: [{ type: "text", text: ptyResult?.output ?? "(completed)" }],
+          details: { exitCode: ptyResult?.exitCode ?? 0, mode: "overlay" },
         };
       }
 
-      // Return captured output — this renders in the tool call result window
+      // Streaming capture mode
+      onUpdate?.({ content: [{ type: "text", text: `Running: ${command}` }] });
+
+      const handle = await spawnPty(command, { cwd: workDir });
+      if (!handle) {
+        return {
+          content: [{ type: "text", text: "(PTY not available — install @lydell/node-pty)" }],
+          details: { exitCode: 1, error: "no-pty", mode: "capture" },
+        };
+      }
+
+      // Stream output via onUpdate periodically
+      let lastUpdate = 0;
+      const UPDATE_INTERVAL = 200; // ms
+
+      const result = await new Promise<{ output: string; exitCode: number | null }>((resolve) => {
+        let timer: any;
+
+        handle.process.onData((_data: string) => {
+          const now = Date.now();
+          if (now - lastUpdate > UPDATE_INTERVAL) {
+            lastUpdate = now;
+            const current = handle.getOutput();
+            if (current) {
+              onUpdate?.({ content: [{ type: "text", text: current }] });
+            }
+          }
+        });
+
+        handle.process.onExit(({ exitCode }: { exitCode: number }) => {
+          clearTimeout(timer);
+          setTimeout(() => {
+            const output = handle.getOutput();
+            resolve({ output, exitCode });
+          }, 50);
+        });
+
+        timer = setTimeout(() => {
+          handle.kill();
+          resolve({ output: handle.getOutput() || "(timeout)", exitCode: null });
+        }, timeoutMs);
+      });
+
+      handle.kill();
+
       const exitInfo = result.exitCode === 0 ? "" : `\n(exit code: ${result.exitCode})`;
       return {
-        content: [{ type: "text", text: result.output + exitInfo }],
+        content: [{ type: "text", text: (result.output || "(no output)") + exitInfo }],
         details: { exitCode: result.exitCode ?? 0, mode: "capture" },
       };
     },
@@ -475,25 +660,30 @@ export default function (pi: ExtensionAPI) {
 
     renderResult(result, { expanded, isPartial }, theme) {
       if (isPartial) {
+        const text = result.content?.[0]?.text ?? "";
+        if (text && text.length > 0 && !text.startsWith("Running:") && !text.startsWith("Starting:")) {
+          // Show live streaming output
+          const lines = text.split("\n");
+          const maxLines = expanded ? 50 : 15;
+          const display = lines.slice(-maxLines).join("\n");
+          return new Text(theme.fg("toolOutput", display), 0, 0);
+        }
         return new Text(theme.fg("muted", "Running..."), 0, 0);
       }
 
       const text = result.content?.[0]?.text ?? "";
       const exitCode = result.details?.exitCode;
 
-      if (text.length === 0) {
-        return new Text(theme.fg("dim", "(no output)"), 0, 0);
-      }
+      if (!text) return new Text(theme.fg("dim", "(no output)"), 0, 0);
 
-      // Show output with exit status
       let display = text;
       if (exitCode !== undefined && exitCode !== 0) {
         display = theme.fg("error", `[exit ${exitCode}] `) + display;
       }
 
-      // Truncate very long output in collapsed view
-      if (!expanded && display.length > 2000) {
-        display = display.substring(0, 2000) + "\n... (expand to see full output)";
+      if (!expanded && display.length > 3000) {
+        const lines = display.split("\n");
+        display = lines.slice(0, 30).join("\n") + `\n... (${lines.length - 30} more lines)`;
       }
 
       return new Text(display, 0, 0);
@@ -501,63 +691,50 @@ export default function (pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // 3. /pty command — capture mode
+  // 3. /pty command — interactive overlay
   // -----------------------------------------------------------------------
   pi.registerCommand("pty", {
-    description: "Run a command with PTY capture (output stays visible)",
+    description: "Run a command with live PTY overlay",
     handler: async (args, ctx) => {
       if (!args || args.trim() === "") {
         ctx.ui.notify("Usage: /pty <command>", "warning");
         return;
       }
 
-      ctx.ui.setStatus("pty", `Running: ${args.trim()}`);
-
-      const result = await runWithPtyCapture(args.trim(), {
-        cwd: ctx.cwd,
-        timeoutMs: 15_000,
-      });
-
-      ctx.ui.setStatus("pty", "");
-
-      if (result.error) {
-        ctx.ui.notify(`PTY error: ${result.error}`, "error");
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("PTY overlay requires TUI mode", "error");
         return;
       }
 
-      // Show output via custom component so it stays on screen
-      await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-        const lines = result.output.split("\n");
-        const maxLines = Math.min(lines.length, 40);
-        const displayLines = lines.slice(0, maxLines);
-        if (lines.length > maxLines) {
-          displayLines.push(`... (${lines.length - maxLines} more lines)`);
-        }
+      const command = args.trim();
 
-        const exitInfo = result.exitCode === 0
-          ? theme.fg("success", `✓ exit 0`)
-          : theme.fg("error", `✗ exit ${result.exitCode}`);
+      await ctx.ui.custom<PtyResult>((tui, _theme, _kb, done) => {
+        let component: PtyOverlayComponent | null = null;
 
-        let dismissed = false;
-        const component = {
+        spawnPty(command, { cwd: ctx.cwd }).then((handle) => {
+          if (!handle) {
+            done({ exitCode: 1, output: "(PTY not available)" });
+            return;
+          }
+          component = new PtyOverlayComponent(handle, tui, done);
+        });
+
+        return {
           render(width: number): string[] {
-            const header = theme.fg("accent", theme.bold(` PTY: ${args.trim()} `)) + exitInfo;
-            const border = theme.fg("border", "─".repeat(Math.min(width, 60)));
-            const content = displayLines.map((l) =>
-              l.length > width ? l.substring(0, width) : l,
-            );
-            const footer = theme.fg("dim", " Press any key to dismiss");
-            return [header, border, ...content, border, footer];
+            if (!component) return ["\x1b[33mStarting PTY...\x1b[0m"];
+            return component.render(width);
           },
-          handleInput(_data: string) {
-            if (!dismissed) {
-              dismissed = true;
-              done(undefined);
-            }
+          handleInput(data: string) {
+            component?.handleInput(data);
+            tui.requestRender();
           },
-          invalidate() {},
+          handleMouse(event: any) {
+            return component?.handleMouse(event);
+          },
+          invalidate() {
+            component?.invalidate();
+          },
         };
-        return component;
       });
     },
   });
