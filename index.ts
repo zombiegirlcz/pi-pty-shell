@@ -261,8 +261,8 @@ function serializeToAnsi(terminal: any, startY: number, endY: number): string[] 
 // PTY + headless terminal module loading (lazy, CJS-interop safe)
 // ---------------------------------------------------------------------------
 
-let ptyModule: any = null | undefined;
-let xtermModule: any = null | undefined;
+let ptyModule: any = undefined;
+let xtermModule: any = undefined;
 
 async function getPty(): Promise<any | null> {
   if (ptyModule !== undefined) return ptyModule;
