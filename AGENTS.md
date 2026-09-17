@@ -20,6 +20,19 @@ pi install git:github.com/zombiegirlcz/pi-pty-shell
 - [x] package.json + index.ts
 - [x] npm install OK (node-pty spawn: function)
 - [x] pi -e ./index.ts -p "řekni jen OK" → OK (ext se načte)
-- [ ] git push na origin
-- [ ] pi install git:… ověření
-- [ ] interaktivní test (!htop, !vim) v TUI
+- [x] git push na origin (commit 8731c36)
+- [x] pi install git:github.com/zombiegirlcz/pi-pty-shell → OK (node-pty OK, spawn: function)
+- [x] Tool pty_exec dostupný v pi session (ověřeno přes pi -p)
+- [ ] Interaktivní test (!htop, !vim) v TUI — vyžaduje ruční test uživatelem
+
+## Instalace
+```bash
+pi install git:github.com/zombiegirlcz/pi-pty-shell
+```
+
+## Použití
+- `!vim file.txt` — auto-detekce interaktivního příkazu
+- `!i any-command` — vynutit interaktivní režim
+- `!htop`, `!nano`, `!git rebase -i HEAD~3`
+- `/pty <command>` — příkaz pro rychlý přístup
+- LLM agent může volat tool `pty_exec`
