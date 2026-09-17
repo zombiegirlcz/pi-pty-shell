@@ -1,0 +1,1 @@
+#zde zapis plan/cil
