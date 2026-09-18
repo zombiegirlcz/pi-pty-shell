@@ -91,8 +91,102 @@ function envList(name: string): string[] {
     .filter(Boolean);
 }
 
+/** Shell wrappers that prefix the real command (sudo/timeout/env/nice/…). */
+const WRAPPER_PREFIXES = new Set([
+  "sudo", "doas", "runuser", "su",
+  "timeout", "nice", "ionice", "chrt", "taskset",
+  "env", "nohup", "setsid", "stdbuf", "unbuffer", "command", "builtin", "exec",
+]);
+
+/** Wrapper flags that consume the following token as their value. */
+const WRAPPER_VALUE_FLAGS = new Set([
+  "-u", "-g", "-p", "-C", "-U", "-r", "-t", "-h",
+  "-n", "-s", "-k", "-i", "-o", "-e", "-c",
+  "--user", "--group", "--signal", "--kill-after", "--adjustment",
+  "--class", "--classdata", "--priority", "--unset", "--chdir",
+]);
+
+/** Wrappers that consume N positional args before the real command. */
+const WRAPPER_POSITIONAL: Record<string, number> = {
+  timeout: 1, // DURATION
+  taskset: 1, // MASK
+  chrt: 1,    // PRIORITY
+};
+
+function tokenizeCommand(cmd: string): string[] {
+  const tokens: string[] = [];
+  let cur = "";
+  let quote: string | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === " " || ch === "\t" || ch === "\n") {
+      if (cur) {
+        tokens.push(cur);
+        cur = "";
+      }
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur) tokens.push(cur);
+  return tokens;
+}
+
+/**
+ * Strip leading shell wrappers to expose the real command.
+ *   "timeout 20 top"        -> "top"
+ *   "sudo -u root htop"     -> "htop"
+ *   "nice -n 5 top"         -> "top"
+ *   "env FOO=bar bash -c x" -> "x"
+ */
+function unwrapCommand(command: string): string {
+  const tokens = tokenizeCommand(command);
+  let i = 0;
+  while (i < tokens.length) {
+    const tok = tokens[i].toLowerCase();
+
+    // `sh -c "cmd"` / `bash -c "cmd"` — extract the -c payload.
+    if (/^(sh|bash|zsh|dash)$/.test(tok) && tokens[i + 1] === "-c" && i + 2 < tokens.length) {
+      return tokens.slice(i + 2).join(" ");
+    }
+
+    if (!WRAPPER_PREFIXES.has(tok)) break;
+    i++;
+    let positionalLeft = WRAPPER_POSITIONAL[tok] ?? 0;
+    while (i < tokens.length) {
+      const t = tokens[i];
+      if (t === "--") {
+        i++;
+        break;
+      }
+      if (t.startsWith("-") && t.length > 1) {
+        const flagName = t.split("=")[0];
+        if (!t.includes("=") && WRAPPER_VALUE_FLAGS.has(flagName)) i += 2;
+        else i += 1;
+        continue;
+      }
+      if (positionalLeft > 0) {
+        i++;
+        positionalLeft--;
+        continue;
+      }
+      if (tok === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+        i++;
+        continue;
+      }
+      break;
+    }
+  }
+  return tokens.slice(i).join(" ");
+}
+
 function commandWords(command: string): string {
-  return command.trim().toLowerCase();
+  return unwrapCommand(command).trim().toLowerCase();
 }
 
 function matchesPrefix(trimmed: string, cmd: string): boolean {
@@ -115,7 +209,7 @@ function isInteractiveCommand(command: string): boolean {
     if (matchesPrefix(trimmed, cmd)) return true;
     const pipeIdx = trimmed.lastIndexOf("|");
     if (pipeIdx !== -1) {
-      const afterPipe = trimmed.slice(pipeIdx + 1).trim();
+      const afterPipe = unwrapCommand(trimmed.slice(pipeIdx + 1)).trim();
       if (matchesPrefix(afterPipe, cmd)) return true;
     }
   }
