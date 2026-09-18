@@ -352,6 +352,127 @@ function serializeToAnsi(terminal: any, startY: number, endY: number): string[] 
 }
 
 // ---------------------------------------------------------------------------
+// Structured snapshot (for the LLM to actually READ a TUI)
+// Ported from gemini-cli's terminalSerializer.ts
+// ---------------------------------------------------------------------------
+
+interface AnsiToken {
+  text: string;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  dim: boolean;
+  inverse: boolean;
+  isCursor: boolean;
+  fg: string;
+  bg: string;
+}
+
+interface TerminalSnapshot {
+  cols: number;
+  cursor: { x: number; y: number };
+  lines: { y: number; text: string; tokens: AnsiToken[] }[];
+}
+
+function cellColor(cell: any, which: "fg" | "bg"): string {
+  try {
+    const isRGB = which === "fg" ? cell.isFgRGB?.() : cell.isBgRGB?.();
+    const isPal = which === "fg" ? cell.isFgPalette?.() : cell.isBgPalette?.();
+    if (isRGB) {
+      const c = which === "fg" ? cell.getFgColor() : cell.getBgColor();
+      return `#${((c >> 16) & 255).toString(16).padStart(2, "0")}${((c >> 8) & 255)
+        .toString(16)
+        .padStart(2, "0")}${(c & 255).toString(16).padStart(2, "0")}`;
+    }
+    if (isPal) return `p${which === "fg" ? cell.getFgColor() : cell.getBgColor()}`;
+  } catch {
+    /* ignore */
+  }
+  return "";
+}
+
+/**
+ * Structured snapshot of a terminal region: size, cursor, and per-line styled
+ * tokens. `inverse` marks the highlighted row in TUIs (htop selection, etc.).
+ */
+function serializeToTokens(terminal: any, startY: number, endY: number): TerminalSnapshot {
+  const buf = terminal.buffer.active;
+  const cols: number = terminal.cols ?? 80;
+  const cursorX = buf.cursorX ?? 0;
+  const absCursorY = (buf.baseY ?? 0) + (buf.cursorY ?? 0);
+  const nullCell = typeof buf.getNullCell === "function" ? buf.getNullCell() : null;
+  const lines: TerminalSnapshot["lines"] = [];
+
+  for (let y = startY; y < endY; y++) {
+    const line = buf.getLine(y);
+    if (!line) {
+      lines.push({ y, text: "", tokens: [] });
+      continue;
+    }
+    const tokens: AnsiToken[] = [];
+    let cur: AnsiToken | null = null;
+
+    for (let x = 0; x < cols; x++) {
+      let cell: any = null;
+      try {
+        cell = nullCell ? line.getCell(x, nullCell) : line.getCell(x);
+      } catch {
+        cell = null;
+      }
+      const ch = cell?.getChars?.() || " ";
+      const isCursor = x === cursorX && y === absCursorY;
+      const t: AnsiToken = {
+        text: ch,
+        bold: !!cell?.isBold?.(),
+        italic: !!cell?.isItalic?.(),
+        underline: !!cell?.isUnderline?.(),
+        dim: !!cell?.isDim?.(),
+        inverse: !!cell?.isInverse?.() || isCursor,
+        isCursor,
+        fg: cellColor(cell, "fg"),
+        bg: cellColor(cell, "bg"),
+      };
+      const same =
+        cur &&
+        cur.bold === t.bold &&
+        cur.italic === t.italic &&
+        cur.underline === t.underline &&
+        cur.dim === t.dim &&
+        cur.inverse === t.inverse &&
+        cur.fg === t.fg &&
+        cur.bg === t.bg &&
+        !t.isCursor &&
+        !cur.isCursor;
+      if (same && cur) {
+        cur.text += t.text;
+      } else {
+        if (cur) tokens.push(cur);
+        cur = t;
+      }
+    }
+    if (cur) tokens.push(cur);
+    while (
+      tokens.length > 0 &&
+      tokens[tokens.length - 1].text.trim() === "" &&
+      !tokens[tokens.length - 1].inverse
+    ) {
+      tokens.pop();
+    }
+    lines.push({ y, text: tokens.map((t) => t.text).join("").replace(/\s+$/, ""), tokens });
+  }
+
+  while (
+    lines.length > 0 &&
+    lines[lines.length - 1].text.trim() === "" &&
+    lines[lines.length - 1].y !== absCursorY
+  ) {
+    lines.pop();
+  }
+
+  return { cols, cursor: { x: cursorX, y: absCursorY }, lines };
+}
+
+// ---------------------------------------------------------------------------
 // PTY + headless terminal module loading (lazy, CJS-interop safe)
 // ---------------------------------------------------------------------------
 
@@ -407,6 +528,10 @@ export interface PtySession {
 }
 
 const sessions = new Map<string, PtySession>();
+
+/** sessionId -> open overlay window (picture-in-picture). */
+const overlays = new Map<string, { close: () => void; control: "user" | "agent" }>();
+
 let sessionCounter = 0;
 
 function newSessionId(): string {
@@ -640,6 +765,7 @@ class PtyOverlayComponent {
   private session: PtySession;
   private tui: any;
   private done: (result: { exitCode: number | null; output: string }) => void;
+  private control: "user" | "agent" = "user";
   private width = 0;
   private cachedLines: string[] = [];
   private cacheKey = -1;
@@ -657,10 +783,12 @@ class PtyOverlayComponent {
     session: PtySession,
     tui: any,
     done: (result: { exitCode: number | null; output: string }) => void,
+    opts?: { control?: "user" | "agent" },
   ) {
     this.session = session;
     this.tui = tui;
     this.done = done;
+    this.control = opts?.control ?? "user";
     session.listeners.add(this.onData);
     session.listeners.add(this.onExit);
   }
@@ -723,12 +851,16 @@ class PtyOverlayComponent {
     const status = running
       ? `\x1b[33m● running\x1b[0m`
       : `\x1b[32m✓ exited ${this.session.exitCode ?? "?"}\x1b[0m`;
+    const modeTag =
+      this.control === "user" ? `\x1b[36muser\x1b[0m` : `\x1b[35magent\x1b[0m`;
     const hint = running
-      ? `\x1b[2m keys → process · Ctrl+] quit overlay\x1b[0m`
+      ? this.control === "user"
+        ? `\x1b[2m keys → process · Ctrl+] close\x1b[0m`
+        : `\x1b[2m watch-only · agent drives\x1b[0m`
       : `\x1b[2m press any key to close\x1b[0m`;
 
     const title = `\x1b[1m pty\x1b[0m \x1b[2m${truncateToWidth(this.session.command, Math.max(1, w - 30))}\x1b[0m`;
-    const header = truncateToWidth(`${title}  ${status}${hint}`, w);
+    const header = truncateToWidth(`${title} ${modeTag}  ${status}${hint}`, w);
     const rule = `\x1b[90m${"─".repeat(Math.max(1, Math.min(w, 200)))}\x1b[0m`;
 
     const lines: string[] = [header, rule];
@@ -756,6 +888,9 @@ class PtyOverlayComponent {
       this.finish();
       return;
     }
+
+    // Watch-only overlay: the user must not steer the process.
+    if (this.control === "agent") return;
 
     // Scrollback (Shift+Up / Shift+Down / Shift+PgUp / Shift+PgDn)
     if (data === "\x1b[1;2A") {
@@ -1263,6 +1398,178 @@ export default function (pi: ExtensionAPI) {
   });
 
   // =======================================================================
+  // 3b. pty_attach / pty_detach / pty_screenshot
+  //     — picture-in-picture window + structured read for the LLM
+  // =======================================================================
+
+  pi.registerTool({
+    name: "pty_attach",
+    label: "PTY Attach",
+    description:
+      "Open a live overlay window (picture-in-picture) for an existing PTY session and " +
+      "return immediately — the window stays open until closed. " +
+      'control="user" forwards the user\'s keyboard into the PTY; control="agent" is ' +
+      "watch-only and you drive the process with pty_write. Close with pty_detach.",
+    promptSnippet: "Open a persistent PTY overlay window so the user can see a session",
+    promptGuidelines: [
+      'Use pty_attach after pty_spawn with control="agent" to show the user a live window of a process you drive.',
+      'Use pty_attach with control="user" when the user should interact with the terminal directly.',
+    ],
+    parameters: Type.Object({
+      sessionId: Type.String(),
+      control: Type.Optional(
+        Type.String({
+          description: '"user" (keyboard forwarded to PTY) or "agent" (watch-only). Default "agent".',
+        }),
+      ),
+      width: Type.Optional(Type.String({ description: 'Overlay width, e.g. "60%" or 80. Default "60%".' })),
+      anchor: Type.Optional(
+        Type.String({ description: 'Overlay anchor: center, top-right, right-center, … Default "right-center".' }),
+      ),
+    }),
+    async execute(_id, params, _s, _u, ctx) {
+      const s = sessions.get(params.sessionId);
+      if (!s) throw new Error(`Unknown session: ${params.sessionId}`);
+      if (ctx.mode !== "tui") throw new Error("pty_attach requires TUI mode");
+
+      const control: "user" | "agent" = params.control === "user" ? "user" : "agent";
+
+      let handleRef: any = null;
+      let finished = false;
+      const close = () => {
+        if (finished) return;
+        finished = true;
+        overlays.delete(s.id);
+        try {
+          handleRef?.hide?.();
+        } catch {
+          /* ignore */
+        }
+      };
+
+      // Fire-and-forget: the custom() promise resolves when the overlay closes,
+      // but we return to the agent immediately so the tool call never blocks.
+      ctx.ui
+        .custom<{ exitCode: number | null; output: string }>(
+          (tui, _t, _k, done) => {
+            return new PtyOverlayComponent(
+              s,
+              tui,
+              (r) => {
+                finished = true;
+                overlays.delete(s.id);
+                done(r);
+              },
+              { control },
+            ) as any;
+          },
+          {
+            overlay: true,
+            overlayOptions: {
+              anchor: (params.anchor as any) ?? "right-center",
+              width: (params.width as any) ?? "60%",
+              maxHeight: "80%",
+              margin: 1,
+              nonCapturing: control === "agent",
+            },
+            onHandle: (h) => {
+              handleRef = h;
+              if (control === "user") {
+                try {
+                  h.focus();
+                } catch {
+                  /* ignore */
+                }
+              }
+            },
+          },
+        )
+        .catch(() => {
+          /* ignore — overlay closed or replaced */
+        });
+
+      overlays.set(s.id, { close, control });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Overlay opened for ${s.id} (control: ${control}).\n` +
+              (control === "user"
+                ? "The user can type into it. Close with Ctrl+] or pty_detach."
+                : "Watch-only. Drive it with pty_write; close with pty_detach."),
+          },
+        ],
+        details: { sessionId: s.id, control },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "pty_detach",
+    label: "PTY Detach",
+    description: "Close the overlay window attached to a PTY session. The session keeps running.",
+    promptSnippet: "Close a PTY overlay window (session keeps running)",
+    parameters: Type.Object({ sessionId: Type.String() }),
+    async execute(_id, params) {
+      const ov = overlays.get(params.sessionId);
+      if (!ov) {
+        return {
+          content: [{ type: "text", text: "(no overlay for that session)" }],
+          details: { sessionId: params.sessionId, closed: false },
+        };
+      }
+      ov.close();
+      return {
+        content: [{ type: "text", text: `Overlay closed for ${params.sessionId}` }],
+        details: { sessionId: params.sessionId, closed: true },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "pty_screenshot",
+    label: "PTY Screenshot",
+    description:
+      "Structured snapshot of a PTY session: terminal size, cursor position, and every " +
+      "line split into styled tokens (bold / dim / inverse / fg / bg). " +
+      "'inverse' marks the highlighted row in TUIs such as htop. " +
+      "Use this to actually read a TUI instead of guessing from plain text.",
+    promptSnippet: "Read a PTY session as structured tokens (cursor, styles, selection)",
+    parameters: Type.Object({
+      sessionId: Type.String(),
+      max_lines: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })),
+    }),
+    async execute(_id, params) {
+      const s = sessions.get(params.sessionId);
+      if (!s) throw new Error(`Unknown session: ${params.sessionId}`);
+
+      if (!s.terminal) {
+        return {
+          content: [
+            { type: "text", text: `(no headless terminal; plain text)\n\n${sessionText(s)}` },
+          ],
+          details: { sessionId: s.id, structured: false },
+        };
+      }
+
+      const buf = s.terminal.buffer.active;
+      const snap = serializeToTokens(s.terminal, 0, buf.length);
+      const lines = params.max_lines ? snap.lines.slice(-params.max_lines) : snap.lines;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ cols: snap.cols, cursor: snap.cursor, lines }, null, 1),
+          },
+        ],
+        details: { sessionId: s.id, structured: true, rows: lines.length },
+      };
+    },
+  });
+
+  // =======================================================================
   // 4. /pty command — interactive overlay shortcut
   // =======================================================================
   pi.registerCommand("pty", {
@@ -1292,6 +1599,14 @@ export default function (pi: ExtensionAPI) {
   // 5. Cleanup on shutdown
   // =======================================================================
   pi.on("session_shutdown", async () => {
+    for (const ov of overlays.values()) {
+      try {
+        ov.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    overlays.clear();
     for (const s of sessions.values()) {
       if (s.status === "running") killSession(s);
       disposeSession(s);
